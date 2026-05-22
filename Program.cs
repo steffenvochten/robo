@@ -13,18 +13,19 @@ while (true)
             .PromptStyle("cyan")
             .Validate(p =>
             {
-                if (string.IsNullOrWhiteSpace(p)) return ValidationResult.Error("[red]Path cannot be empty.[/]");
-                if (!Directory.Exists(p)) return ValidationResult.Error("[red]Directory does not exist.[/]");
+                string cleaned = p.Trim('"', ' ');
+                if (string.IsNullOrWhiteSpace(cleaned)) return ValidationResult.Error("[red]Path cannot be empty.[/]");
+                if (!Directory.Exists(cleaned)) return ValidationResult.Error("[red]Directory does not exist.[/]");
                 return ValidationResult.Success();
-            }));
+            })).Trim('"', ' ');
 
     // Target
     string target = AnsiConsole.Prompt(
         new TextPrompt<string>("[green]Target folder:[/]")
             .PromptStyle("cyan")
-            .Validate(p => string.IsNullOrWhiteSpace(p)
+            .Validate(p => string.IsNullOrWhiteSpace(p.Trim('"', ' '))
                 ? ValidationResult.Error("[red]Path cannot be empty.[/]")
-                : ValidationResult.Success()));
+                : ValidationResult.Success())).Trim('"', ' ');
 
     // Offer resolved target path (source name appended) as editable pre-filled input
     string sourceName = Path.GetFileName(source.TrimEnd('\\', '/'));
@@ -34,7 +35,7 @@ while (true)
         string edited;
         do
         {
-            edited = ReadLineEditable("[cyan]Final target folder:[/] ", resolved);
+            edited = ReadLineEditable("[cyan]Final target folder:[/] ", resolved).Trim('"', ' ');
             if (string.IsNullOrWhiteSpace(edited))
                 AnsiConsole.MarkupLine("[red]Path cannot be empty.[/]");
         } while (string.IsNullOrWhiteSpace(edited));
@@ -83,8 +84,42 @@ while (true)
         roboArgs.Add($"/W:{retryWait}");
     }
 
-    // Build display string (manually quote paths/args with spaces)
-    static string Quote(string s) => s.Contains(' ') ? $"\"{s}\"" : s;
+    // Build display string (manually quote paths/args with space or special chars according to Windows CLI rules)
+    static string Quote(string arg)
+    {
+        if (string.IsNullOrEmpty(arg)) return "\"\"";
+        if (!arg.Contains(' ') && !arg.Contains('\"') && !arg.Contains('\t')) return arg;
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append('"');
+        for (int i = 0; i < arg.Length; i++)
+        {
+            int backslashCount = 0;
+            while (i < arg.Length && arg[i] == '\\')
+            {
+                backslashCount++;
+                i++;
+            }
+
+            if (i == arg.Length)
+            {
+                sb.Append('\\', backslashCount * 2);
+                break;
+            }
+            else if (arg[i] == '"')
+            {
+                sb.Append('\\', backslashCount * 2 + 1);
+                sb.Append('"');
+            }
+            else
+            {
+                sb.Append('\\', backslashCount);
+                sb.Append(arg[i]);
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
     string display = "robocopy " + string.Join(" ", roboArgs.Select(Quote));
 
     AnsiConsole.WriteLine();
@@ -99,29 +134,43 @@ while (true)
     }
     else
     {
-        var psi = new ProcessStartInfo("robocopy") { UseShellExecute = false };
-        foreach (var arg in roboArgs) psi.ArgumentList.Add(arg);
-
-        var proc = Process.Start(psi)!;
-        proc.WaitForExit();
-        int code = proc.ExitCode;
-
-        AnsiConsole.WriteLine();
-        (string label, Color color) Interpret(int c) => c switch
+        try
         {
-            0 => ("No files were copied. Source and destination are in sync.", Color.Green),
-            1 => ("Files copied successfully.", Color.Green),
-            2 => ("Extra files or directories detected in destination.", Color.Yellow),
-            3 => ("Files copied; extra files detected.", Color.Yellow),
-            4 => ("Some files or directories could not be copied (mismatched).", Color.Yellow),
-            5 => ("Files copied; some mismatches detected.", Color.Yellow),
-            6 => ("Extra files and mismatches; no copy was done.", Color.Yellow),
-            7 => ("Files copied with some mismatches and extra files.", Color.Yellow),
-            _ => ($"Error — exit code {c}. Check output above.", Color.Red)
-        };
+            var psi = new ProcessStartInfo("robocopy") { UseShellExecute = false };
+            foreach (var arg in roboArgs) psi.ArgumentList.Add(arg);
 
-        var (msg, color) = Interpret(code);
-        AnsiConsole.MarkupLine($"[bold {color}]Exit code {code}:[/] {Markup.Escape(msg)}");
+            var proc = Process.Start(psi);
+            if (proc == null)
+            {
+                AnsiConsole.MarkupLine("[bold red]Error:[/] Could not start robocopy process.");
+                continue;
+            }
+            proc.WaitForExit();
+            int code = proc.ExitCode;
+
+            AnsiConsole.WriteLine();
+            (string label, Color color) Interpret(int c) => c switch
+            {
+                0 => ("No files were copied. Source and destination are in sync.", Color.Green),
+                1 => ("Files copied successfully.", Color.Green),
+                2 => ("Extra files or directories detected in destination.", Color.Yellow),
+                3 => ("Files copied; extra files detected.", Color.Yellow),
+                4 => ("Some files or directories could not be copied (mismatched).", Color.Yellow),
+                5 => ("Files copied; some mismatches detected.", Color.Yellow),
+                6 => ("Extra files and mismatches; no copy was done.", Color.Yellow),
+                7 => ("Files copied with some mismatches and extra files.", Color.Yellow),
+                8 => ("Several files did not copy (check output/errors).", Color.Red),
+                16 => ("Serious error. Robocopy did not copy any files.", Color.Red),
+                _ => ($"Exit code {c}. Check output above.", c > 8 ? Color.Red : Color.Yellow)
+            };
+
+            var (msg, color) = Interpret(code);
+            AnsiConsole.MarkupLine($"[bold {color}]Exit code {code}:[/] {Markup.Escape(msg)}");
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[bold red]Failed to execute robocopy:[/] {Markup.Escape(ex.Message)}");
+        }
     }
 
     AnsiConsole.WriteLine();
@@ -135,26 +184,51 @@ static string ReadLineEditable(string label, string prefill)
 {
     AnsiConsole.Markup(label);
     int startLeft = Console.CursorLeft;
-    int startTop  = Console.CursorTop;
-    int width     = Console.BufferWidth;
     var buf       = new System.Text.StringBuilder(prefill);
     int cur       = prefill.Length;
     Console.Write(prefill);
 
-    void MoveTo(int offset)
+    void MoveTo(int targetCur)
     {
-        int abs = startLeft + offset;
+        int width = Console.BufferWidth;
+        int startTop = Console.CursorTop - (startLeft + cur) / width;
+        int abs = startLeft + targetCur;
         Console.CursorTop  = startTop + abs / width;
         Console.CursorLeft = abs % width;
+        cur = targetCur;
     }
 
-    void Redraw(int oldLen)
+    void Redraw(int oldLen, int targetCur)
     {
+        int width = Console.BufferWidth;
+        int startTop = Console.CursorTop - (startLeft + cur) / width;
         Console.CursorTop  = startTop;
         Console.CursorLeft = startLeft;
         Console.Write(buf.ToString());
-        if (oldLen > buf.Length) Console.Write(new string(' ', oldLen - buf.Length));
-        MoveTo(cur);
+        if (oldLen > buf.Length) 
+            Console.Write(new string(' ', oldLen - buf.Length));
+        
+        int writeLen = Math.Max(buf.Length, oldLen);
+        cur = writeLen;
+        MoveTo(targetCur);
+    }
+
+    static int FindWordBoundaryLeft(string s, int start)
+    {
+        if (start <= 0) return 0;
+        int idx = start - 1;
+        while (idx > 0 && char.IsWhiteSpace(s[idx])) idx--;
+        while (idx > 0 && !char.IsWhiteSpace(s[idx - 1])) idx--;
+        return idx;
+    }
+
+    static int FindWordBoundaryRight(string s, int start)
+    {
+        if (start >= s.Length) return s.Length;
+        int idx = start;
+        while (idx < s.Length && !char.IsWhiteSpace(s[idx])) idx++;
+        while (idx < s.Length && char.IsWhiteSpace(s[idx])) idx++;
+        return idx;
     }
 
     while (true)
@@ -166,39 +240,60 @@ static string ReadLineEditable(string label, string prefill)
                 Console.WriteLine();
                 return buf.ToString();
             case ConsoleKey.LeftArrow:
-                if (cur > 0) MoveTo(--cur);
+                if (k.Modifiers.HasFlag(ConsoleModifiers.Control))
+                {
+                    MoveTo(FindWordBoundaryLeft(buf.ToString(), cur));
+                }
+                else if (cur > 0)
+                {
+                    MoveTo(cur - 1);
+                }
                 break;
             case ConsoleKey.RightArrow:
-                if (cur < buf.Length) MoveTo(++cur);
+                if (k.Modifiers.HasFlag(ConsoleModifiers.Control))
+                {
+                    MoveTo(FindWordBoundaryRight(buf.ToString(), cur));
+                }
+                else if (cur < buf.Length)
+                {
+                    MoveTo(cur + 1);
+                }
                 break;
             case ConsoleKey.Home:
-                cur = 0; MoveTo(0);
+                MoveTo(0);
                 break;
             case ConsoleKey.End:
-                cur = buf.Length; MoveTo(cur);
+                MoveTo(buf.Length);
                 break;
             case ConsoleKey.Backspace:
                 if (cur > 0)
                 {
                     int old = buf.Length;
-                    buf.Remove(--cur, 1);
-                    Redraw(old);
+                    int target = k.Modifiers.HasFlag(ConsoleModifiers.Control)
+                        ? FindWordBoundaryLeft(buf.ToString(), cur)
+                        : cur - 1;
+                    buf.Remove(target, cur - target);
+                    Redraw(old, target);
                 }
                 break;
             case ConsoleKey.Delete:
                 if (cur < buf.Length)
                 {
                     int old = buf.Length;
-                    buf.Remove(cur, 1);
-                    Redraw(old);
+                    int target = k.Modifiers.HasFlag(ConsoleModifiers.Control)
+                        ? FindWordBoundaryRight(buf.ToString(), cur)
+                        : cur + 1;
+                    buf.Remove(cur, target - cur);
+                    Redraw(old, cur);
                 }
                 break;
             default:
                 if (!char.IsControl(k.KeyChar))
                 {
                     int old = buf.Length;
-                    buf.Insert(cur++, k.KeyChar);
-                    Redraw(old);
+                    int target = cur + 1;
+                    buf.Insert(cur, k.KeyChar);
+                    Redraw(old, target);
                 }
                 break;
         }
